@@ -1,52 +1,120 @@
 <?php
-require_once '../config.php';
+require_once '../../config.php';
 session_start();
 
-header('Content-Type: application/json');
+// حماية الصفحة
+if (!isset($_SESSION['role']) || $_SESSION['role'] !== 'professor') {
+    header("Location: ../login.php");
+    exit();
+}
 
-// --- إعدادات الاختبار (تجاوز الحماية مؤقتاً إذا كنتِ تختبرين الرابط مباشرة) ---
-$professor_id = $_SESSION['user_id'] ?? 2; // إذا لم يوجد جلسة، نعتبر الأستاذ رقم 2 هو المستخدم
+$professor_id = $_SESSION['user_id'];
+$message = "";
 
-// استقبال البيانات من الرابط (GET) أو من الطلبات البرمجية (JSON/POST)
-$data = json_decode(file_get_contents('php://input'), true) ?? $_POST;
-$student_id = $data['student_id'] ?? $_GET['student_id'] ?? null;
-$course_id  = $data['course_id'] ?? $_GET['course_id'] ?? null;
-$grade      = $data['grade'] ?? $_GET['grade'] ?? null;
+// 1. معالجة حفظ الدرجة (استخدام اسم العمود grade)
+if ($_SERVER['REQUEST_METHOD'] == 'POST' && isset($_POST['save_grade'])) {
+    $student_id = $_POST['student_id'];
+    $course_id = $_POST['course_id'];
+    $semester_id = $_POST['semester_id'];
+    $grade = $_POST['grade']; // تم التعديل هنا
 
-if ($student_id && $course_id && $grade !== null) {
     try {
-        // التحقق من وجود سجل مسبق لتحديثه أو إنشاء واحد جديد
         $check = $pdo->prepare("SELECT id FROM grades WHERE student_id = ? AND course_id = ?");
         $check->execute([$student_id, $course_id]);
         
         if ($check->rowCount() > 0) {
-            // تحديث الدرجة
-            $stmt = $pdo->prepare("UPDATE grades SET grade = ?, professor_id = ?, entered_at = NOW() WHERE student_id = ? AND course_id = ?");
+            $sql = "UPDATE grades SET grade = ?, professor_id = ? WHERE student_id = ? AND course_id = ?";
+            $stmt = $pdo->prepare($sql);
             $stmt->execute([$grade, $professor_id, $student_id, $course_id]);
-            $msg = "تم تحديث الدرجة بنجاح";
         } else {
-            // إضافة درجة جديدة (جلب semester_id تلقائياً من جدول المواد)
-            $get_sem = $pdo->prepare("SELECT semester_id FROM courses WHERE id = ?");
-            $get_sem->execute([$course_id]);
-            $semester_id = $get_sem->fetchColumn() ?: 1;
-
-            $stmt = $pdo->prepare("INSERT INTO grades (student_id, course_id, semester_id, professor_id, grade, entered_at) VALUES (?, ?, ?, ?, ?, NOW())");
+            $sql = "INSERT INTO grades (student_id, course_id, semester_id, professor_id, grade) VALUES (?, ?, ?, ?, ?)";
+            $stmt = $pdo->prepare($sql);
             $stmt->execute([$student_id, $course_id, $semester_id, $professor_id, $grade]);
-            $msg = "تم إضافة الدرجة بنجاح";
         }
-
-        echo json_encode([
-            "status" => "success",
-            "message" => $msg,
-            "data" => ["student_id" => $student_id, "course_id" => $course_id, "grade" => $grade]
-        ]);
-
+        $message = "✅ تم حفظ الدرجة بنجاح!";
     } catch (PDOException $e) {
-        echo json_encode(["status" => "error", "message" => "خطأ في قاعدة البيانات: " . $e->getMessage()]);
+        $message = "❌ خطأ: " . $e->getMessage();
     }
-} else {
-    echo json_encode([
-        "status" => "error", 
-        "message" => "بيانات ناقصة. للاختبار استعملي الرابط مع ?student_id=3&course_id=1&grade=18"
-    ]);
 }
+
+// 2. جلب المواد المسندة للأستاذ
+$stmt_c = $pdo->prepare("SELECT c.id, c.name, a.semester_id FROM assignments a 
+                         INNER JOIN courses c ON a.course_id = c.id 
+                         WHERE a.professor_id = ?");
+$stmt_c->execute([$professor_id]);
+$assigned_courses = $stmt_c->fetchAll();
+
+// 3. جلب الطلاب (تعديل الاستعلام ليتوافق مع الصورة الأخيرة)
+$enrollments = [];
+if (isset($_GET['course_id'])) {
+    $selected_course = $_GET['course_id'];
+    // جلب الـ semester_id الخاص بالمادة المختارة
+    $stmt_sem = $pdo->prepare("SELECT semester_id FROM courses WHERE id = ?");
+    $stmt_sem->execute([$selected_course]);
+    $sem_data = $stmt_sem->fetch();
+    $current_semester = $sem_data['semester_id'];
+
+    $sql_students = "SELECT u.id as student_id, u.name as student_name, g.grade 
+                     FROM users u
+                     INNER JOIN enrollments e ON u.id = e.student_id
+                     LEFT JOIN grades g ON (g.student_id = u.id AND g.course_id = ?)
+                     WHERE e.semester_id = ? AND u.role = 'student'";
+    
+    $stmt_s = $pdo->prepare($sql_students);
+    $stmt_s->execute([$selected_course, $current_semester]);
+    $enrollments = $stmt_s->fetchAll();
+}
+?>
+
+<!DOCTYPE html>
+<html lang="ar" dir="rtl">
+<head>
+    <meta charset="UTF-8">
+    <title>رصد الدرجات</title>
+    <style>
+        body { font-family: sans-serif; background: #f4f7f6; padding: 20px; }
+        .card { background: white; padding: 20px; border-radius: 10px; box-shadow: 0 2px 5px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        table { width: 100%; border-collapse: collapse; }
+        th, td { padding: 10px; border: 1px solid #ddd; text-align: center; }
+        .success { color: green; font-weight: bold; }
+    </style>
+</head>
+<body>
+    <div class="card">
+        <h2>لوحة الأستاذ</h2>
+        <?php if($message) echo "<p class='success'>$message</p>"; ?>
+        <form method="GET">
+            <select name="course_id" onchange="this.form.submit()">
+                <option value="">-- اختر المادة --</option>
+                <?php foreach ($assigned_courses as $c): ?>
+                    <option value="<?= $c['id'] ?>" <?= isset($_GET['course_id']) && $_GET['course_id'] == $c['id'] ? 'selected' : '' ?>>
+                        <?= $c['name'] ?>
+                    </option>
+                <?php endforeach; ?>
+            </select>
+        </form>
+    </div>
+
+    <?php if (isset($_GET['course_id'])): ?>
+    <div class="card">
+        <table>
+            <tr><th>الطالب</th><th>الدرجة الحالية</th><th>رصد درجة</th></tr>
+            <?php foreach ($enrollments as $row): ?>
+            <tr>
+                <td><?= $row['student_name'] ?></td><td><?=$row['grade'] ?? 'غير مرصودة' ?></td>
+                <td>
+                    <form method="POST">
+                        <input type="hidden" name="student_id" value="<?= $row['student_id'] ?>">
+                        <input type="hidden" name="course_id" value="<?= $_GET['course_id'] ?>">
+                        <input type="hidden" name="semester_id" value="<?= $current_semester ?>">
+                        <input type="number" name="grade" step="0.01" min="0" max="20" required>
+                        <button type="submit" name="save_grade">حفظ</button>
+                    </form>
+                </td>
+            </tr>
+            <?php endforeach; ?>
+        </table>
+    </div>
+    <?php endif; ?>
+</body>
+</html>
